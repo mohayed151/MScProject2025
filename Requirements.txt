@@ -1,12 +1,9 @@
+alpha_vantage
+ta
 pandas
 numpy
-yfinance
-ta
-tweepy
-textblob
-scikit-learn
 xgboost
-tensorflow
-keras-tuner
 matplotlib
-seaborn
+shap
+scikit-learn
+kagglehub

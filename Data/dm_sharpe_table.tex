@@ -1,0 +1,14 @@
+\begin{table}[H]
+\centering
+\caption{Diebold--Mariano and Sharpe Ratio Difference Tests}
+\begin{tabular}{l l r r r r r r}
+\hline
+Model A & Model B & DM Stat & p-value & Sharpe A & Sharpe B & CI Low & CI High \\
+\hline
+LSTM & XGBoost & 17.0872 & 0.000\textsuperscript{***} & 2.1644 & -11.9011 & 10.5054 & 23.1346 \\
+LSTM & LastPrice & 0.4520 & 0.651 & 2.1644 & -7.8939 & 6.7790 & 16.3837 \\
+XGBoost & LastPrice & -17.6268 & 0.000\textsuperscript{***} & -11.9011 & -7.8939 & -7.3621 & -1.4097 \\
+\hline
+\end{tabular}
+\label{tab:dm_sharpe_results}
+\end{table}
