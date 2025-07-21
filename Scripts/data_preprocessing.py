@@ -1,142 +1,113 @@
 import pandas as pd
-import numpy as np
-import ta  # Technical Analysis library
-import tweepy
-import logging
-from textblob import TextBlob
+import yfinance as yf
+import intraday
 from datetime import datetime, timedelta
 import os
+import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def calculate_technical_indicators(df):
+def download_daily_data(ticker='^GSPC', start_date='2020-07-20', end_date='2025-07-20'):
     """
-    Calculate technical indicators (RSI, MACD, Bollinger Bands, VWAP) for intra-day data.
+    Download daily S&P 500 data using yfinance and clean it.
     
     Args:
-        df (pd.DataFrame): Intra-day data with Open, High, Low, Close, Volume columns.
+        ticker (str): Ticker symbol for S&P 500 (^GSPC).
+        start_date (str): Start date in YYYY-MM-DD format.
+        end_date (str): End date in YYYY-MM-DD format.
     
     Returns:
-        pd.DataFrame: DataFrame with added indicator columns.
+        pd.DataFrame: Cleaned daily data.
     """
     try:
-        logger.info("Calculating technical indicators")
-        df = df.copy()
+        logger.info(f"Downloading daily data for {ticker} from {start_date} to {end_date}")
+        df = yf.download(ticker, start=start_date, end=end_date, interval='1d')
         
-        # Relative Strength Index (RSI, 14-period)
-        df['RSI'] = ta.momentum.RSIIndicator(df['Close'], window=14).rsi()
+        if df.empty:
+            logger.error("No data downloaded. Check ticker or date range.")
+            raise ValueError("No data downloaded.")
         
-        # Moving Average Convergence Divergence (MACD)
-        macd = ta.trend.MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9)
-        df['MACD'] = macd.macd()
-        df['MACD_Signal'] = macd.macd_signal()
+        # Clean data
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        df.dropna(inplace=True)  # Remove rows with missing values
         
-        # Bollinger Bands (20-period, 2 std)
-        bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
-        df['BB_High'] = bb.bollinger_hband()
-        df['BB_Low'] = bb.bollinger_lband()
+        # Remove outliers (e.g., price anomalies > 3 standard deviations)
+        df = df[df['Close'].between(df['Close'].mean() - 3 * df['Close'].std(),
+                                    df['Close'].mean() + 3 * df['Close'].std())]
         
-        # Volume Weighted Average Price (VWAP)
-        df['VWAP'] = (df['Close'] * df['Volume']).cumsum() / df['Volume'].cumsum()
-        
-        # Drop rows with NaN values from indicators
-        df.dropna(inplace=True)
+        # Save to CSV
+        os.makedirs('data/raw', exist_ok=True)
+        output_path = 'data/raw/sp500_daily.csv'
+        df.to_csv(output_path)
+        logger.info(f"Daily data saved to {output_path}")
         
         return df
     
     except Exception as e:
-        logger.error(f"Error calculating technical indicators: {str(e)}")
+        logger.error(f"Error downloading daily data: {str(e)}")
         raise
 
-def calculate_sentiment_scores(ticker='^GSPC', api_key=None, api_secret=None, access_token=None, access_secret=None):
+def download_intraday_data(ticker='^GSPC'):
     """
-    Calculate sentiment scores from Twitter data using Tweepy and TextBlob.
+    Download and cache intra-day S&P 500 data using intraday module.
     
     Args:
-        ticker (str): Ticker symbol for sentiment analysis.
-        api_key, api_secret, access_token, access_secret (str): Twitter API credentials.
+        ticker (str): Ticker symbol for S&P 500 (^GSPC).
     
     Returns:
-        pd.DataFrame: Sentiment scores aligned with intra-day data timestamps.
+        pd.DataFrame: Cached intra-day data (1-minute intervals).
     """
     try:
-        logger.info(f"Fetching Twitter sentiment for {ticker}")
+        logger.info(f"Updating intra-day data for {ticker}")
+        df = intraday.update_ticker(ticker)
         
-        # Initialize Twitter API (replace with your credentials)
-        auth = tweepy.OAuthHandler(api_key, api_secret)
-        auth.set_access_token(access_token, access_secret)
-        api = tweepy.API(auth, wait_on_rate_limit=True)
+        if df is None or df.empty:
+            logger.error("No intra-day data retrieved. Check intraday module or cache.")
+            raise ValueError("No intra-day data retrieved.")
         
-        # Fetch tweets from the last 30 days
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=30)
-        query = f"${ticker} -filter:retweets"
-        tweets = tweepy.Cursor(api.search_tweets, q=query, lang='en', 
-                              since=start_date.strftime('%Y-%m-%d'), 
-                              until=end_date.strftime('%Y-%m-%d')).items(1000)
+        # Ensure UTC timezone for consistency
+        df.index = df.index.tz_convert('UTC')
         
-        # Calculate sentiment scores
-        sentiment_data = []
-        for tweet in tweets:
-            text = tweet.text
-            sentiment = TextBlob(text).sentiment.polarity
-            timestamp = tweet.created_at
-            sentiment_data.append({'Timestamp': timestamp, 'Sentiment': sentiment})
+        # Clean data
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        df.dropna(inplace=True)
         
-        sentiment_df = pd.DataFrame(sentiment_data)
-        sentiment_df['Timestamp'] = pd.to_datetime(sentiment_df['Timestamp']).dt.tz_localize('UTC')
+        # Remove outliers
+        df = df[df['Close'].between(df['Close'].mean() - 3 * df['Close'].std(),
+                                    df['Close'].mean() + 3 * df['Close'].std())]
         
-        # Aggregate sentiment by minute
-        sentiment_df = sentiment_df.groupby(pd.Grouper(key='Timestamp', freq='1min')).mean().reset_index()
+        # Save updated cache
+        os.makedirs('data/intraday', exist_ok=True)
+        output_path = f'data/intraday/{ticker}_intraday.csv'
+        df.to_csv(output_path)
+        logger.info(f"Intra-day data saved to {output_path}")
         
-        return sentiment_df
+        return df
     
     except Exception as e:
-        logger.error(f"Error calculating sentiment scores: {str(e)}")
+        logger.error(f"Error downloading intra-day data: {str(e)}")
         raise
 
 def main():
-    """
-    Main function to load intra-day data, calculate features, and save to CSV.
-    """
+    """Main function to download and clean both daily and intra-day data."""
     try:
-        # Load intra-day data
-        input_path = 'data/intraday/^GSPC_intraday.csv'
-        if not os.path.exists(input_path):
-            raise FileNotFoundError(f"Input file {input_path} not found.")
+        # Download daily data
+        daily_df = download_daily_data()
+        logger.info(f"Daily data shape: {daily_df.shape}")
         
-        df = pd.read_csv(input_path, index_col='Datetime', parse_dates=True)
-        logger.info(f"Loaded intra-day data with shape: {df.shape}")
+        # Download intra-day data
+        intraday_df = download_intraday_data()
+        logger.info(f"Intra-day data shape: {intraday_df.shape}")
         
-        # Calculate technical indicators
-        df = calculate_technical_indicators(df)
-        
-        # Calculate sentiment scores (replace with your Twitter API credentials)
-        sentiment_df = calculate_sentiment_scores(
-            api_key='YOUR_API_KEY',
-            api_secret='YOUR_API_SECRET',
-            access_token='YOUR_ACCESS_TOKEN',
-            access_secret='YOUR_ACCESS_SECRET'
-        )
-        
-        # Merge sentiment with price data
-        df = df.merge(sentiment_df, left_index=True, right_on='Timestamp', how='left')
-        df['Sentiment'].fillna(0, inplace=True)  # Neutral sentiment for missing data
-        
-        # Save features
-        os.makedirs('data/features', exist_ok=True)
-        output_path = 'data/features/sp500_intraday_features.csv'
-        df.to_csv(output_path)
-        logger.info(f"Features saved to {output_path}")
-        
-        return df
+        return daily_df, intraday_df
     
     except Exception as e:
         logger.error(f"Error in main function: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    features_df = main()
-    print("Features data head:\n", features_df.head())
+    daily_data, intraday_data = main()
+    print("Daily data head:\n", daily_data.head())
+    print("Intra-day data head:\n", intraday_data.head())
