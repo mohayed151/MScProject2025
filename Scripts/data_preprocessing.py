@@ -1,6 +1,5 @@
 import pandas as pd
 import yfinance as yf
-import intraday
 from datetime import datetime, timedelta
 import os
 import logging
@@ -8,6 +7,12 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Check pandas version
+required_pandas_version = "1.0.0"
+if pd.__version__ < required_pandas_version:
+    logger.error(f"pandas version {pd.__version__} is outdated. Please upgrade to {required_pandas_version} or later.")
+    raise ImportError(f"pandas version {pd.__version__} is outdated. Please upgrade to {required_pandas_version} or later.")
 
 def download_daily_data(ticker='^GSPC', start_date='2020-07-20', end_date='2025-07-20'):
     """
@@ -23,19 +28,45 @@ def download_daily_data(ticker='^GSPC', start_date='2020-07-20', end_date='2025-
     """
     try:
         logger.info(f"Downloading daily data for {ticker} from {start_date} to {end_date}")
-        df = yf.download(ticker, start=start_date, end=end_date, interval='1d')
+        # Explicitly set auto_adjust=False to ensure consistent columns
+        df = yf.download(ticker, start=start_date, end=end_date, interval='1d', auto_adjust=False)
         
         if df.empty:
             logger.error("No data downloaded. Check ticker or date range.")
             raise ValueError("No data downloaded.")
         
+        # Log DataFrame structure for debugging
+        logger.info(f"Downloaded DataFrame columns: {list(df.columns)}")
+        
+        # Handle multi-level columns
+        if isinstance(df.columns, pd.MultiIndex):
+            logger.info("Multi-level columns detected. Flattening to single level.")
+            df.columns = [col[0] for col in df.columns]  # Use first level (e.g., 'Close' from ('Close', '^GSPC'))
+        
+        # Verify required columns
+        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in df.columns for col in required_columns):
+            missing_cols = [col for col in required_columns if col not in df.columns]
+            logger.error(f"Missing columns in downloaded data: {missing_cols}")
+            raise ValueError(f"Missing columns in downloaded data: {missing_cols}")
+        
         # Clean data
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        df = df[required_columns].copy()
         df.dropna(inplace=True)  # Remove rows with missing values
         
-        # Remove outliers (e.g., price anomalies > 3 standard deviations)
-        df = df[df['Close'].between(df['Close'].mean() - 3 * df['Close'].std(),
-                                    df['Close'].mean() + 3 * df['Close'].std())]
+        # Ensure Close is numeric
+        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+        if df['Close'].isna().any():
+            logger.warning("Non-numeric values found in Close column after conversion. Dropping invalid rows.")
+            df.dropna(subset=['Close'], inplace=True)
+        
+        if not df.empty:
+            # Remove outliers (e.g., price anomalies > 3 standard deviations)
+            close_mean = df['Close'].mean()
+            close_std = df['Close'].std()
+            df = df[df['Close'].between(close_mean - 3 * close_std, close_mean + 3 * close_std)]
+        else:
+            logger.warning("DataFrame is empty after cleaning. No data to process.")
         
         # Save to CSV
         os.makedirs('data/raw', exist_ok=True)
@@ -51,32 +82,56 @@ def download_daily_data(ticker='^GSPC', start_date='2020-07-20', end_date='2025-
 
 def download_intraday_data(ticker='^GSPC'):
     """
-    Download and cache intra-day S&P 500 data using intraday module.
+    Download intra-day S&P 500 data using yfinance.
     
     Args:
         ticker (str): Ticker symbol for S&P 500 (^GSPC).
     
     Returns:
-        pd.DataFrame: Cached intra-day data (1-minute intervals).
+        pd.DataFrame: Intra-day data (1-minute intervals).
     """
     try:
-        logger.info(f"Updating intra-day data for {ticker}")
-        df = intraday.update_ticker(ticker)
+        logger.info(f"Downloading intra-day data for {ticker}")
+        # Download 1-minute data for the last 7 days (yfinance limit)
+        df = yf.download(ticker, interval='1m', period='7d', auto_adjust=False)
         
-        if df is None or df.empty:
-            logger.error("No intra-day data retrieved. Check intraday module or cache.")
+        if df.empty:
+            logger.error("No intra-day data retrieved. Check ticker or yfinance limits.")
             raise ValueError("No intra-day data retrieved.")
+        
+        # Log DataFrame structure for debugging
+        logger.info(f"Downloaded intra-day DataFrame columns: {list(df.columns)}")
+        
+        # Handle multi-level columns
+        if isinstance(df.columns, pd.MultiIndex):
+            logger.info("Multi-level columns detected in intra-day data. Flattening to single level.")
+            df.columns = [col[0] for col in df.columns]  # Use first level (e.g., 'Close' from ('Close', '^GSPC'))
+        
+        # Verify required columns
+        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in df.columns for col in required_columns):
+            missing_cols = [col for col in required_columns if col not in df.columns]
+            logger.error(f"Missing columns in intra-day data: {missing_cols}")
+            raise ValueError(f"Missing columns in intra-day data: {missing_cols}")
         
         # Ensure UTC timezone for consistency
         df.index = df.index.tz_convert('UTC')
         
         # Clean data
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        df = df[required_columns].copy()
         df.dropna(inplace=True)
         
-        # Remove outliers
-        df = df[df['Close'].between(df['Close'].mean() - 3 * df['Close'].std(),
-                                    df['Close'].mean() + 3 * df['Close'].std())]
+        # Ensure Close is numeric
+        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+        if df['Close'].isna().any():
+            logger.warning("Non-numeric values found in Close column after conversion. Dropping invalid rows.")
+            df.dropna(subset=['Close'], inplace=True)
+        
+        if not df.empty:
+            # Remove outliers
+            close_mean = df['Close'].mean()
+            close_std = df['Close'].std()
+            df = df[df['Close'].between(close_mean - 3 * close_std, close_mean + 3 * close_std)]
         
         # Save updated cache
         os.makedirs('data/intraday', exist_ok=True)
