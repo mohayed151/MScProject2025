@@ -1,0 +1,12 @@
+pandas
+numpy
+yfinance
+ta
+tweepy
+textblob
+scikit-learn
+xgboost
+tensorflow
+keras-tuner
+matplotlib
+seaborn
