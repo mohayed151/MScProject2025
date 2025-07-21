@@ -1,116 +1,119 @@
 import pandas as pd
 import numpy as np
-from xgboost import XGBRegressor
-from tensorflow.keras.models import load_model
 import logging
-import os
+import joblib
+from sklearn.metrics import accuracy_score
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def backtest_strategy(df, model, model_type='xgboost', lookback=60, threshold=0.001):
+def backtest_model(data_path='data/processed/sp500_train_data.csv', model_path='models/rf_model.joblib', 
+                  feature_columns_path='models/feature_columns.txt'):
     """
-    Backtest a trading strategy using ML predictions.
+    Perform walk-forward backtesting on the model using saved data and model.
     
     Args:
-        df (pd.DataFrame): Data with features and actual Close prices.
-        model: Trained XGBoost or LSTM model.
-        model_type (str): 'xgboost' or 'lstm'.
-        lookback (int): Lookback period for LSTM sequences.
-        threshold (float): Minimum predicted price change to trigger a trade.
+        data_path (str): Path to the processed data CSV.
+        model_path (str): Path to the trained model.
+        feature_columns_path (str): Path to the feature columns text file.
     
     Returns:
-        pd.DataFrame: Backtest results with metrics.
+        pd.DataFrame: Backtest results with predictions, target, and returns.
     """
     try:
-        logger.info(f"Backtesting {model_type} model")
-        df = df.copy()
-        df['Predicted_Close'] = np.nan
+        logger.info("Starting backtesting")
         
-        # Generate predictions
-        if model_type == 'xgboost':
-            features = ['Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'MACD', 
-                        'MACD_Signal', 'BB_High', 'BB_Low', 'VWAP', 'Sentiment']
-            X = df[features].values
-            df['Predicted_Close'] = model.predict(X)
+        # Load data
+        df = pd.read_csv(data_path, index_col=0, parse_dates=True)
+        logger.info(f"Loaded data shape: {df.shape}")
+        logger.info(f"Loaded data columns: {list(df.columns)}")
         
-        elif model_type == 'lstm':
-            X_seq = []
-            features = ['Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'MACD', 
-                        'MACD_Signal', 'BB_High', 'BB_Low', 'VWAP', 'Sentiment']
-            X = df[features].values
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
-            for i in range(lookback, len(X_scaled)):
-                X_seq.append(X_scaled[i-lookback:i])
-            X_seq = np.array(X_seq)
-            df.iloc[lookback:, df.columns.get_loc('Predicted_Close')] = model.predict(X_seq).flatten()
+        # Load feature columns
+        with open(feature_columns_path, 'r') as f:
+            feature_columns = f.read().split(',')
+        logger.info(f"Loaded feature columns: {feature_columns}")
         
-        else:
-            raise ValueError("Invalid model_type. Use 'xgboost' or 'lstm'.")
+        # Load model
+        model = joblib.load(model_path)
+        logger.info(f"Loaded model from {model_path}")
         
-        # Trading strategy: Buy if predicted increase > threshold, sell if decrease > threshold
-        df['Signal'] = 0
-        df['Price_Change'] = df['Predicted_Close'].pct_change()
-        df.loc[df['Price_Change'] > threshold, 'Signal'] = 1  # Buy
-        df.loc[df['Price_Change'] < -threshold, 'Signal'] = -1  # Sell
+        # Ensure required columns
+        required_columns = feature_columns + ['Close', 'Returns', 'Target']
+        if not all(col in df.columns for col in required_columns):
+            missing_cols = [col for col in required_columns if col not in df.columns]
+            logger.error(f"Missing columns for backtesting: {missing_cols}")
+            raise ValueError(f"Missing columns for backtesting: {missing_cols}")
         
-        # Calculate returns
-        df['Returns'] = df['Close'].pct_change()
-        df['Strategy_Returns'] = df['Returns'] * df['Signal'].shift(1)
-        df['Cumulative_Returns'] = (1 + df['Strategy_Returns']).cumprod() - 1
+        # Initialize backtest columns
+        df['Prediction'] = 0
+        df['Strategy_Return'] = 0.0
         
-        # Calculate metrics
-        sharpe_ratio = (df['Strategy_Returns'].mean() / df['Strategy_Returns'].std()) * np.sqrt(252 * 390)  # Annualized (390 min/day)
-        max_drawdown = (df['Cumulative_Returns'].cummax() - df['Cumulative_Returns']).max()
-        total_return = df['Cumulative_Returns'].iloc[-1]
+        # Walk-forward backtesting
+        train_size = int(len(df) * 0.6)  # Initial training size
+        step_size = 20  # Number of days to step forward
+        for i in range(train_size, len(df) - 1, step_size):
+            train_df = df.iloc[:i]
+            test_df = df.iloc[i:i + step_size]
+            
+            if len(test_df) == 0:
+                continue
+            
+            # Prepare training data
+            X_train = train_df[feature_columns]
+            y_train = train_df['Target']
+            
+            # Retrain model
+            model.fit(X_train, y_train)
+            
+            # Prepare test data
+            X_test = test_df[feature_columns]
+            predictions = model.predict(X_test)
+            
+            # Store predictions
+            df.loc[test_df.index, 'Prediction'] = predictions
+            
+            # Calculate strategy returns (buy if predict up, hold if down)
+            df.loc[test_df.index, 'Strategy_Return'] = np.where(
+                predictions == 1, test_df['Returns'], 0.0
+            )
         
-        logger.info(f"Sharpe Ratio: {sharpe_ratio:.2f}, Total Return: {total_return:.2%}, Max Drawdown: {max_drawdown:.2%}")
+        # Calculate cumulative returns
+        df['Cumulative_Strategy_Return'] = (1 + df['Strategy_Return'] / 100).cumprod() - 1
+        df['Cumulative_Market_Return'] = (1 + df['Returns'] / 100).cumprod() - 1
         
-        # Save results
-        os.makedirs('results', exist_ok=True)
-        output_path = f'results/{model_type}_backtest.csv'
+        # Calculate performance metrics
+        total_trades = (df['Prediction'] == 1).sum()
+        accuracy = accuracy_score(df['Target'].iloc[train_size:], df['Prediction'].iloc[train_size:])
+        annualized_return = df['Strategy_Return'].mean() * 252  # Assuming 252 trading days
+        sharpe_ratio = (df['Strategy_Return'].mean() * 252) / (df['Strategy_Return'].std() * np.sqrt(252)) if df['Strategy_Return'].std() != 0 else 0
+        
+        logger.info(f"Backtest results: Total trades = {total_trades}, Accuracy = {accuracy:.4f}")
+        logger.info(f"Annualized return: {annualized_return:.4f}%")
+        logger.info(f"Sharpe ratio: {sharpe_ratio:.4f}")
+        
+        # Save backtest results
+        os.makedirs('data/backtest', exist_ok=True)
+        output_path = 'data/backtest/sp500_backtest_results.csv'
         df.to_csv(output_path)
         logger.info(f"Backtest results saved to {output_path}")
         
-        return df, {'Sharpe_Ratio': sharpe_ratio, 'Total_Return': total_return, 'Max_Drawdown': max_drawdown}
+        return df
     
     except Exception as e:
         logger.error(f"Error in backtesting: {str(e)}")
         raise
 
 def main():
-    """
-    Main function to load data, load models, and backtest strategies.
-    """
+    """Main function to run backtesting."""
     try:
-        # Load feature data
-        input_path = 'data/features/sp500_intraday_features.csv'
-        if not os.path.exists(input_path):
-            raise FileNotFoundError(f"Input file {input_path} not found.")
-        
-        df = pd.read_csv(input_path, index_col='Timestamp', parse_dates=True)
-        logger.info(f"Loaded features with shape: {df.shape}")
-        
-        # Load models
-        xgb_model = XGBRegressor()
-        xgb_model.load_model('models/xgboost_model.json')
-        lstm_model = load_model('models/lstm_model.h5')
-        
-        # Backtest both models
-        xgb_results, xgb_metrics = backtest_strategy(df, xgb_model, model_type='xgboost')
-        lstm_results, lstm_metrics = backtest_strategy(df, lstm_model, model_type='lstm')
-        
-        logger.info(f"XGBoost Metrics: {xgb_metrics}")
-        logger.info(f"LSTM Metrics: {lstm_metrics}")
-        
-        return xgb_results, lstm_results, xgb_metrics, lstm_metrics
+        backtest_results = backtest_model()
+        print("Backtest results head:\n", backtest_results[['Close', 'Target', 'Prediction', 'Strategy_Return', 'Cumulative_Strategy_Return']].head())
+        return backtest_results
     
     except Exception as e:
         logger.error(f"Error in main function: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    xgb_results, lstm_results, xgb_metrics, lstm_metrics = main()
-    print("Backtesting completed. Metrics:", xgb_metrics, lstm_metrics)
+    backtest_results = main()
